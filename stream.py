@@ -679,6 +679,13 @@ class AntigravityStream(Iterator[Any]):
             detail = parsed["message"]
             if parsed.get("resets"):
                 detail = f"{detail} (resets {parsed['resets']})"
+            # A limit the CLI reports only through its status (RESOURCE_EXHAUSTED
+            # / 429) with a message that never says "quota" would reach the
+            # error classifier as plain text and be retried like any failure.
+            # Carry the canonical status so the verdict does not depend on the
+            # wording of the message.
+            if parsed.get("limit") and "resource_exhausted" not in detail.lower():
+                detail = f"{detail} [RESOURCE_EXHAUSTED]"
             return detail
         return error_msg or stderr_out.strip() or fallback
 

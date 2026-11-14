@@ -201,8 +201,74 @@ def harden_agy_settings(
         tmp_path = settings_path.with_suffix(".json.tmp")
         tmp_path.write_text(_json.dumps(settings, indent=1), encoding="utf-8")
         os.replace(tmp_path, settings_path)
+    except OSError as exc:
+        # Not fatal, but not silent either: this agy process starts with the
+        # account's own settings, so `useG1Credits` is whatever the user has.
+        logger.warning(
+            "Could not write the hardened Antigravity settings.json (%s); "
+            "this turn runs with the account's own settings.",
+            exc,
+        )
+
+
+def _remove_planted_config(home: Path) -> None:
+    """Delete the AGY_PLANTED entries of *home*, and nothing outside it.
+
+    The cleanup runs unsandboxed with the user's own rights, on paths a turn's
+    shell may have shaped. Three cases would turn it into a delete of the
+    user's real files, so each one is refused before anything is removed:
+
+    - *home* resolves to the real home (a caller-supplied ``cwd`` that puts
+      the "isolated" home on top of it): AGY_PLANTED then names the user's
+      own ``~/.gemini/GEMINI.md`` and ``~/.gemini/config``.
+    - ``.gemini`` is a link, or resolves outside *home*: same files, one hop
+      away.
+    - ``.gemini/config`` is a link. The link is itself planted config (agy
+      would load whatever it points at), so the link is removed and its
+      target is never entered.
+    """
+    try:
+        home_real = home.resolve()
+        real_home = Path.home().resolve()
+    except (OSError, RuntimeError):
+        return
+    if home_real == real_home:
+        logger.warning(
+            "Antigravity isolated home %s is the real home; planted-config cleanup skipped.",
+            home,
+        )
+        return
+    gemini = home / ".gemini"
+    try:
+        gemini_escapes = gemini.is_symlink() or (
+            gemini.exists() and gemini.resolve() != home_real / ".gemini"
+        )
     except OSError:
-        logger.debug("Could not write hardened settings.json", exc_info=True)
+        return
+    if gemini_escapes:
+        logger.warning(
+            "Antigravity isolated %s is a link out of the isolated home; "
+            "planted-config cleanup skipped.",
+            gemini,
+        )
+        return
+    config = gemini / "config"
+    if config.is_symlink():
+        with contextlib.suppress(OSError):
+            config.unlink()
+    for rel in AGY_PLANTED:
+        target = home / rel
+        try:
+            if target.parent.resolve() != (home_real / rel).parent:
+                continue
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+        except OSError:
+            # A turn's own shell may have put anything there; one unremovable
+            # entry must not fail the turn.
+            continue
 
 
 def prepare_agy_home(
@@ -215,20 +281,9 @@ def prepare_agy_home(
 
     Both are read by agy at spawn, so this runs right before every worker and
     every oneshot process. Removal is limited to AGY_PLANTED inside the
-    isolated home, so a user's own files are never in reach.
+    isolated home and never follows a link out of it (``_remove_planted_config``).
     """
-    home = Path(isolated_home)
-    for rel in AGY_PLANTED:
-        target = home / rel
-        try:
-            if target.is_symlink() or target.is_file():
-                target.unlink()
-            elif target.is_dir():
-                shutil.rmtree(target, ignore_errors=True)
-        except OSError:
-            # A turn's own shell may have put anything there; one unremovable
-            # entry must not fail the turn.
-            continue
+    _remove_planted_config(Path(isolated_home))
     harden_agy_settings(isolated_gemini_dir, use_credits=use_credits)
 
 
