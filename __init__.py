@@ -225,6 +225,33 @@ def _classify_antigravity_error(
             "should_fallback": False,
             "should_compress": False,
         }
+    # The plan's own limits (agy's AGY_ERROR status RESOURCE_EXHAUSTED/429, or
+    # its "Individual quota reached ... resets in 2h 30m" words). Ported from
+    # agentes.chat, which maps the same line to `plan_limit` with the reset it
+    # names (brain-antigravity.ts `antigravityProblem`). Left unclassified these
+    # turns were retried against a quota that only comes back hours later; a
+    # rate_limit verdict backs off and fails over instead. Placed AFTER the
+    # billing checks so an AI-credits message keeps its own mapping.
+    if any(
+        pattern in err_str
+        for pattern in (
+            "quota",
+            "resource_exhausted",
+            "resource exhausted",
+            "rate limit",
+            "usage limit",
+            "weekly limit",
+            "five hour limit",
+            "five-hour limit",
+            "out of credits",
+        )
+    ):
+        return {
+            "reason": "rate_limit",
+            "retryable": True,
+            "should_fallback": True,
+            "should_compress": False,
+        }
     return None
 
 

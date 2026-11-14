@@ -111,6 +111,218 @@ def write_media_read_permissions(
     return read_media_rules(isolated_gemini_dir)
 
 
+# --- Turn-home hardening (ported from agentes.chat's agy-home.ts, ADR 0143) ---
+#
+# agy keeps global agents, skills, rules, hooks, plugins and the GEMINI.md /
+# AGENTS.md rule files under its home, and a turn that writes one of them makes
+# a later turn load it as its own config — outside every tool and outside the
+# <tool_call> protocol this plugin relies on. agentes.chat removes exactly this
+# set before every turn (AGY_PLANTED); the paths are relative to the CLI's HOME,
+# which for this plugin is the per-client isolated home, so nothing here can
+# ever reach the user's real ~/.gemini.
+
+AGY_PLANTED: tuple[str, ...] = (
+    ".gemini/config/agents",
+    ".gemini/config/skills",
+    ".gemini/config/rules",
+    ".gemini/config/plugins",
+    ".gemini/config/projects",
+    ".gemini/config/hooks.json",
+    ".gemini/config/config.json",
+    ".gemini/config/skills.json",
+    ".gemini/config/rules.json",
+    ".gemini/config/plugins.json",
+    ".gemini/config/agents.json",
+    ".gemini/config/GEMINI.md",
+    ".gemini/config/AGENTS.md",
+    ".gemini/GEMINI.md",
+    ".gemini/AGENTS.md",
+)
+
+# Settings every turn wants, whatever the user's account looks like. Written by
+# merging into the isolated settings.json, which agy reads at spawn only.
+#
+# - `useG1Credits: false`: a turn past the plan's quota fails instead of
+#   silently spending the account's AI credits. agentes.chat hardcodes the same
+#   (agy-home.ts) and calls the alternative "spending money without asking";
+#   ANTIGRAVITY_USE_CREDITS=1 opts a paid account back in.
+# - `enableTerminalSandbox`: any terminal step agy does run stays in its
+#   sandbox (the turn's folder and temp, no network).
+# - The three noise switches: a headless turn has no one to answer a survey or
+#   click a tip, and the CLI writes those interactions into its log.
+#
+# Deliberately NOT set: `toolPermission` and `allowNonWorkspaceAccess`. This
+# plugin wants agy's native tools refused (headless cannot prompt, so they are
+# soft-denied) and needs paths outside the workspace readable for the media
+# attach it grants per file — forcing either would change behavior that works.
+_AGY_SETTINGS_HARDENED: dict[str, Any] = {
+    "useG1Credits": False,
+    "enableTerminalSandbox": True,
+    "notifications": False,
+    "showTips": False,
+    "showFeedbackSurvey": False,
+}
+
+
+def _read_settings(settings_path: Path) -> dict[str, Any]:
+    try:
+        settings = _json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def harden_agy_settings(
+    isolated_gemini_dir: str | Path, *, use_credits: bool | None = None
+) -> None:
+    """Merge the hardening settings into the isolated ``settings.json``.
+
+    Everything this plugin does not own is preserved: the sign-in's ``auth``
+    block, an Enterprise seat's ``gcp``, and the per-file media
+    ``permissions.allow`` rules ``write_media_read_permissions`` adds. Atomic
+    replace, and a no-op rewrite when the file already says the same thing.
+    """
+    if use_credits is None:
+        use_credits = os.getenv("ANTIGRAVITY_USE_CREDITS", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+    settings_path = Path(isolated_gemini_dir) / "settings.json"
+    settings = _read_settings(settings_path)
+    wanted = dict(_AGY_SETTINGS_HARDENED)
+    wanted["useG1Credits"] = bool(use_credits)
+    if all(settings.get(key) == value for key, value in wanted.items()):
+        return
+    settings.update(wanted)
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = settings_path.with_suffix(".json.tmp")
+        tmp_path.write_text(_json.dumps(settings, indent=1), encoding="utf-8")
+        os.replace(tmp_path, settings_path)
+    except OSError:
+        logger.debug("Could not write hardened settings.json", exc_info=True)
+
+
+def prepare_agy_home(
+    isolated_home: str | Path,
+    isolated_gemini_dir: str | Path,
+    *,
+    use_credits: bool | None = None,
+) -> None:
+    """Before a spawn: drop what an earlier turn planted, then write the hardened settings.
+
+    Both are read by agy at spawn, so this runs right before every worker and
+    every oneshot process. Removal is limited to AGY_PLANTED inside the
+    isolated home, so a user's own files are never in reach.
+    """
+    home = Path(isolated_home)
+    for rel in AGY_PLANTED:
+        target = home / rel
+        try:
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            elif target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+        except OSError:
+            # A turn's own shell may have put anything there; one unremovable
+            # entry must not fail the turn.
+            continue
+    harden_agy_settings(isolated_gemini_dir, use_credits=use_credits)
+
+
+# --- The CLI's own failure line ------------------------------------------------
+#
+# agy 1.2.x writes `AGY_ERROR: {…}` to stderr when a model or agent step fails:
+# its canonical status, an HTTP or gRPC code, retryability and a message.
+# Without this, the whole blob reaches the user as one opaque sentence and a
+# quota-exhausted turn is retried like any other error. agentes.chat parses the
+# same line (brain-antigravity.ts `parseAgyError`).
+
+_AGY_LIMIT_RE = re.compile(
+    r"quota|rate.?limit|usage limit|resource.?exhausted|weekly limit|five.?hour limit|out of credits",
+    re.IGNORECASE,
+)
+# The CLI can't sign in: signed out, a refused token, no license.
+_AGY_AUTH_RE = re.compile(
+    r"auth(?:entication)? required|not (?:authenticated|logged in|signed in)"
+    r"|unauthenticated|unauthori[sz]ed|\b401\b|invalid (?:token|credentials|grant)|licen[cs]e",
+    re.IGNORECASE,
+)
+# "resets in 2h 30m", "resets at 2026-11-14T14:00Z" — kept verbatim, so the
+# message tells the user when the plan comes back without this plugin guessing.
+_AGY_RESET_RE = re.compile(
+    r"\b(?:resets?|refresh(?:es)?)\s+(?:at|on|in)\s+([^,;.\n]{1,48})", re.IGNORECASE
+)
+
+
+def parse_agy_error(stderr: str) -> dict[str, Any] | None:
+    """Read the last ``AGY_ERROR:`` line of *stderr*; ``None`` when there is none.
+
+    Returns ``{"message", "limit", "auth", "resets"}``: the CLI's own words (or
+    the raw line when it isn't JSON), whether it is a plan/quota limit, whether
+    it is a refused sign-in, and the reset words when the message carries them.
+    """
+    text = stderr or ""
+    line = next(
+        (l for l in reversed(text.splitlines()) if l.strip().startswith("AGY_ERROR:")),
+        "",
+    )
+    if not line:
+        return None
+    raw = line.strip()[len("AGY_ERROR:") :].strip()
+    payload: dict[str, Any] = {}
+    try:
+        parsed = _json.loads(raw)
+        if isinstance(parsed, dict):
+            payload = parsed
+    except ValueError:
+        # A non-JSON AGY_ERROR line is still the CLI's own failure words.
+        return {
+            "message": raw[:500] or "The Antigravity CLI reported a failure",
+            "limit": bool(_AGY_LIMIT_RE.search(raw)),
+            "auth": bool(_AGY_AUTH_RE.search(raw)),
+            "resets": _reset_words(raw),
+        }
+
+    def _str(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (int, float)):
+            return str(value)
+        return ""
+
+    status = " ".join(
+        _str(payload.get(key))
+        for key in ("status", "canonical_status", "code", "http_status")
+    )
+    # agy 1.5.8's own format string is `AGY_ERROR: {"short_error":%q}`; the
+    # richer object agentes.chat read (status/canonical_status) is kept as a
+    # fallback so an older or newer CLI still parses.
+    message = (
+        _str(payload.get("short_error"))
+        or _str(payload.get("message"))
+        or _str(payload.get("error"))
+        or status.strip()
+        or "The model call failed"
+    )[:500]
+    return {
+        "message": message,
+        "limit": bool(re.search(r"RESOURCE_EXHAUSTED|\b429\b", status, re.IGNORECASE))
+        or bool(_AGY_LIMIT_RE.search(message)),
+        "auth": bool(re.search(r"UNAUTHENTICATED|\b401\b", status, re.IGNORECASE))
+        or bool(_AGY_AUTH_RE.search(message)),
+        "resets": _reset_words(message),
+    }
+
+
+def _reset_words(text: str) -> str:
+    """The reset words a failure message carries ("in 2h 30m"), or ``""``."""
+    match = _AGY_RESET_RE.search(text or "")
+    return match.group(1).strip() if match else ""
+
+
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
 
