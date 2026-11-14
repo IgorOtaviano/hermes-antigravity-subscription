@@ -63,7 +63,10 @@ try:
         _parse_tool_block,
         _render_message_content,
         _is_plugin_owned_media_path,
+        frame_prompt_part,
         media_reference_paths,
+        multipart_enabled,
+        split_prompt_parts,
     )
     from .delivery import DeliveryWatch
     from .stream import (
@@ -107,7 +110,10 @@ except ImportError:
         _parse_tool_block,
         _render_message_content,
         _is_plugin_owned_media_path,
+        frame_prompt_part,
         media_reference_paths,
+        multipart_enabled,
+        split_prompt_parts,
     )
     from delivery import DeliveryWatch
     from stream import (
@@ -906,6 +912,75 @@ class AntigravityClient:
             self._arm_idle_timer_locked()
             return proc
 
+    def _write_worker_prompt(
+        self,
+        proc: subprocess.Popen,
+        prompt_payload: str,
+        *,
+        model: str,
+        timeout: float,
+        messages: list[dict[str, Any]],
+        expected_conversation_id: str | None,
+    ) -> str | None:
+        """Write one turn's prompt to the worker, in several messages when it is long.
+
+        agy cuts a single message at a fixed size (see ``prompt._PART_MAX_BYTES``)
+        but keeps everything a conversation was told. A prompt over the part
+        limit is therefore delivered as consecutive messages of the same
+        conversation: every part but the last is its own short turn that only
+        asks for an acknowledgement, read here to its end, and the last part is
+        written for the caller's stream to read as the real turn.
+
+        Returns the conversation id the caller's stream must still check: the
+        first turn after a resume proves the conversation, so once a part has
+        been acknowledged there is nothing left to expect. Raises
+        BrokenPipeError/OSError from a write like a plain write does, and
+        RuntimeError when a part's turn does not complete.
+        """
+        parts = split_prompt_parts(prompt_payload) if multipart_enabled() else [prompt_payload]
+        total = len(parts)
+        for index, part in enumerate(parts[:-1], start=1):
+            framed = frame_prompt_part(part, index, total)
+            proc.stdin.write(
+                json.dumps({"event": "user", "message": {"content": framed}}) + "\n"
+            )
+            proc.stdin.flush()
+            ack_stream = AntigravityStream(
+                proc=proc,
+                client=self,
+                model=model,
+                timeout=timeout,
+                is_worker=True,
+                messages=messages,
+                # No baseline: the tokens of every part are reported with the
+                # real turn, as one send would report them.
+                usage_baseline=None,
+                prompt_chars=len(framed),
+                expected_conversation_id=expected_conversation_id,
+                ack_turn=True,
+            )
+            collect_stream_completion(ack_stream)
+            if ack_stream._interrupted or proc.poll() is not None:
+                raise RuntimeError(
+                    "Antigravity execution failed: the worker stopped while a long input "
+                    f"was being delivered in parts (part {index} of {total})."
+                )
+            expected_conversation_id = None
+        if total > 1:
+            logger.info(
+                "Antigravity prompt of %d chars delivered in %d parts.",
+                len(prompt_payload),
+                total,
+            )
+        proc.stdin.write(
+            json.dumps(
+                {"event": "user", "message": {"content": frame_prompt_part(parts[-1], total, total)}}
+            )
+            + "\n"
+        )
+        proc.stdin.flush()
+        return expected_conversation_id
+
     def _run_oneshot_completion(
         self,
         *,
@@ -1061,6 +1136,7 @@ class AntigravityClient:
                         delta_msgs,
                         pending_user_text=_latest_user_text(messages_list),
                         media_sink=self._materialized_media,
+                        multipart=multipart_enabled(),
                     )
                     dump_prompt_debug(
                         prompt=prompt_payload,
@@ -1080,6 +1156,7 @@ class AntigravityClient:
                         tools=tools,
                         tool_choice=tool_choice,
                         media_sink=self._materialized_media,
+                        multipart=multipart_enabled(),
                     )
                     dump_prompt_debug(
                         prompt=prompt_payload,
@@ -1088,10 +1165,15 @@ class AntigravityClient:
                         messages=messages_list,
                     )
 
-                event_msg = {"event": "user", "message": {"content": prompt_payload}}
                 try:
-                    proc.stdin.write(json.dumps(event_msg) + "\n")
-                    proc.stdin.flush()
+                    expected_conversation_id = self._write_worker_prompt(
+                        proc,
+                        prompt_payload,
+                        model=resolved_model,
+                        timeout=effective_timeout,
+                        messages=messages_list,
+                        expected_conversation_id=expected_conversation_id,
+                    )
                 except (BrokenPipeError, OSError):
                     comparable_full_send = True
                     expected_conversation_id = None
@@ -1105,6 +1187,7 @@ class AntigravityClient:
                         tools=tools,
                         tool_choice=tool_choice,
                         media_sink=self._materialized_media,
+                        multipart=multipart_enabled(),
                     )
                     dump_prompt_debug(
                         prompt=prompt_payload,
@@ -1112,9 +1195,14 @@ class AntigravityClient:
                         model=resolved_model,
                         messages=messages_list,
                     )
-                    event_msg = {"event": "user", "message": {"content": prompt_payload}}
-                    proc.stdin.write(json.dumps(event_msg) + "\n")
-                    proc.stdin.flush()
+                    self._write_worker_prompt(
+                        proc,
+                        prompt_payload,
+                        model=resolved_model,
+                        timeout=effective_timeout,
+                        messages=messages_list,
+                        expected_conversation_id=None,
+                    )
 
                 with self._lock:
                     worker_usage_baseline = self._worker_usage_baseline
@@ -1185,6 +1273,7 @@ class AntigravityClient:
                             tools=tools,
                             tool_choice=tool_choice,
                             media_sink=self._materialized_media,
+                            multipart=multipart_enabled(),
                         )
                         dump_prompt_debug(
                             prompt=prompt_payload,
@@ -1192,13 +1281,14 @@ class AntigravityClient:
                             model=resolved_model,
                             messages=messages_list,
                         )
-                        event_msg = {
-                            "event": "user",
-                            "message": {"content": prompt_payload},
-                        }
-                        if proc.stdin:
-                            proc.stdin.write(json.dumps(event_msg) + "\n")
-                            proc.stdin.flush()
+                        self._write_worker_prompt(
+                            proc,
+                            prompt_payload,
+                            model=resolved_model,
+                            timeout=effective_timeout,
+                            messages=messages_list,
+                            expected_conversation_id=None,
+                        )
                         with self._lock:
                             worker_usage_baseline = self._worker_usage_baseline
                         stream_iter = AntigravityStream(
@@ -1237,11 +1327,15 @@ class AntigravityClient:
                     proc = self._get_or_spawn_worker(
                         resolved_model, effort, conversation_id=self._worker_conversation_id
                     )
-                    event_msg = {"event": "user", "message": {"content": prompt_payload}}
                     try:
-                        if proc.stdin:
-                            proc.stdin.write(json.dumps(event_msg) + "\n")
-                            proc.stdin.flush()
+                        self._write_worker_prompt(
+                            proc,
+                            prompt_payload,
+                            model=resolved_model,
+                            timeout=effective_timeout,
+                            messages=messages_list,
+                            expected_conversation_id=None,
+                        )
                     except (BrokenPipeError, OSError):
                         break
                     with self._lock:

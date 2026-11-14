@@ -545,20 +545,71 @@ _PROMPT_PREAMBLE = (
     "- When the user's latest message introduces a new question or task, do NOT continue prior completed tasks or tool loops. Address the user's latest request directly.",
 )
 
-# Prompt budget (issue #29). A single turn whose assembled prompt is very large
-# gets truncated by agy from the TAIL, which silently drops the latest user
-# request and the tool-loop instructions at the end of the prompt. The fix is
-# the same one agentes-chat uses for its cursor prompt: a hard character budget
-# with MIDDLE elision, so the head (system preamble + tool schemas) and the tail
-# (latest user request, tool-loop objective) always survive.
+def _env_int(name: str, default: int) -> int:
+    """An integer setting from the environment; a value that is not one keeps the default.
+
+    Read at import, so a typo in the variable must not stop the plugin from loading.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Ignoring %s=%r: not an integer, using %d.", name, raw, default)
+        return default
+
+
+# --- Size limits of one message to agy ---------------------------------------
+#
+# agy cuts a single user message at a fixed size and drops everything after it,
+# silently: the turn completes, exit code 0. Measured on agy 1.5.9 with
+# gemini-3.8-flash-low and gemini-4-hydrogen-medium (same result on both): the
+# cut falls between 183,000 and 194,000 UTF-8 bytes of the message, whatever the
+# text is (English prose, Python source, accented Portuguese, digit tables). It
+# is a byte limit, not a token limit: 168,000 characters of digit tables
+# (177,000 input tokens) arrive whole, while 334,000 characters of prose
+# (about 85,000 tokens) arrive cut at about 186,000.
+#
+# What the conversation itself can hold is far larger: four messages of
+# 139,000 characters each in one conversation (152,000 input tokens) were all
+# recalled. So a long input is delivered as several messages (multipart, see
+# split_prompt_parts) instead of being shortened.
+
+# Multipart delivery on the persistent worker. One message never exceeds this
+# many UTF-8 bytes, frame included. 0 or negative turns multipart off, which
+# restores the single-message behaviour and its budgets below.
+_PART_MAX_BYTES = _env_int("HERMES_AGY_PART_MAX_BYTES", 140_000)
+# Bytes reserved for the frame frame_prompt_part() puts around a part.
+_PART_FRAME_BYTES = 900
+# With multipart on, the whole input may be this large before its middle is
+# elided (about 200,000 tokens of prose, under the 239,000 the plugin declares).
+_WORKER_PROMPT_MAX_CHARS = _env_int("HERMES_AGY_WORKER_PROMPT_MAX_CHARS", 800_000)
+# With multipart on, one tool result may be this large before it is cut.
+_WORKER_TOOL_RESULT_MAX_CHARS = _env_int("HERMES_AGY_TOOL_RESULT_MAX_CHARS", 400_000)
+
+# Single-message budget (multipart off, and the oneshot path, which has no
+# conversation to deliver parts into): a hard character budget with MIDDLE
+# elision, so the head (system preamble + tool schemas) and the tail (latest
+# user request, tool-loop objective) survive agy's cut.
 #
 # Override with HERMES_AGY_PROMPT_MAX_CHARS; 0 or negative disables the budget.
-_PROMPT_MAX_CHARS = int(os.environ.get("HERMES_AGY_PROMPT_MAX_CHARS", "120000") or 120000)
+_PROMPT_MAX_CHARS = _env_int("HERMES_AGY_PROMPT_MAX_CHARS", 120_000)
+# Single-message cap of one tool result.
+_TOOL_RESULT_MAX_CHARS = 20_000
 
-# Sections that must never be elided, even when over budget: instruction blocks
-# and the newest request the model has to answer (the last section is always
-# kept as well, whatever it is).
-_PROMPT_PINNED_PREFIXES = ("### ",)
+# A request restated next to the transcript (objective and tool-loop anchors)
+# is bounded: the full text is already in the conversation, and restating a
+# long request on every tool turn would spend the context on copies of it.
+_RESTATEMENT_MAX_CHARS = 4_000
+_RESTATEMENT_HEAD_CHARS = 3_000
+_RESTATEMENT_TAIL_CHARS = 600
+
+# Sections that must never be elided, even when over budget: instruction blocks,
+# the tool schemas (cut in their middle they are invalid JSON) and the newest
+# request the model has to answer (the last section is always kept as well,
+# whatever it is).
+_PROMPT_PINNED_PREFIXES = ("### ", "Available tools")
 _TRANSCRIPT_SECTION_PREFIX = "Conversation transcript:"
 
 # agy attaches media pixels through its own native read step: the model must
@@ -702,6 +753,34 @@ def _render_message_content(content: Any, media_sink: Optional[set] = None) -> s
     return _normalize_media_notes(_clean_rendered_text(str(content)), media_sink)
 
 
+def _bounded_restatement(user_text: str) -> str:
+    """A request as it is restated beside the transcript: whole, or its two ends.
+
+    Only for the anchors that repeat a request the conversation already holds
+    in full. The section that delivers the request itself is never bounded.
+    """
+    if len(user_text) <= _RESTATEMENT_MAX_CHARS:
+        return user_text
+    omitted = len(user_text) - _RESTATEMENT_HEAD_CHARS - _RESTATEMENT_TAIL_CHARS
+    return (
+        user_text[:_RESTATEMENT_HEAD_CHARS]
+        + f"\n[... {omitted} chars of this request are not repeated here; "
+        "its full text is the User message in the conversation ...]\n"
+        + user_text[-_RESTATEMENT_TAIL_CHARS:]
+    )
+
+
+def _cap_tool_output(rendered_content: str, cap: int) -> str:
+    """Cut one tool result past *cap* characters, keeping its head and its tail."""
+    if cap <= 0 or len(rendered_content) <= cap:
+        return rendered_content
+    return (
+        rendered_content[: int(cap * 0.6)]
+        + f"\n[... large tool output truncated: {len(rendered_content)} chars ...]\n"
+        + rendered_content[-int(cap * 0.15):]
+    )
+
+
 def _latest_user_request_section(user_text: str) -> str:
     """Format the canonical LATEST USER REQUEST section and anti-loop instruction."""
     return (
@@ -744,7 +823,7 @@ def _pending_user_request_section(user_text: str) -> str:
     example re-sending an earlier completion report).
     """
     return (
-        f"### USER REQUEST THIS TOOL LOOP IS SERVING:\nUser:\n{user_text}\n\n"
+        f"### USER REQUEST THIS TOOL LOOP IS SERVING:\nUser:\n{_bounded_restatement(user_text)}\n\n"
         "INSTRUCTION: Use the tool results only to answer THIS request. "
         "When you have enough information, answer it directly and specifically. "
         "Do NOT repeat earlier reports or summaries from the transcript unless this request asks for them."
@@ -760,7 +839,7 @@ def _tool_loop_objective_section(user_text: str) -> str:
     """
     return (
         "### ACTIVE OBJECTIVE:\n"
-        f"The user request being served is:\n\"{user_text}\"\n\n"
+        f"The user request being served is:\n\"{_bounded_restatement(user_text)}\"\n\n"
         "CRITICAL: The conversation transcript below contains prior history and the tool calls made so far. "
         "Use the tool results ONLY to address the ACTIVE OBJECTIVE above. "
         "When tool execution is complete, your final answer must directly address this objective. "
@@ -886,8 +965,16 @@ def _format_messages_as_prompt(
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
     media_sink: Optional[set] = None,
+    multipart: bool = False,
 ) -> str:
-    """Assemble Hermes message history, system prompt, and tool schemas into a canonical prompt."""
+    """Assemble Hermes message history, system prompt, and tool schemas into a canonical prompt.
+
+    ``multipart``: the caller delivers the result as several messages
+    (``split_prompt_parts``), so nothing is shortened to fit one message: tool
+    results keep their content up to ``_WORKER_TOOL_RESULT_MAX_CHARS``, older
+    tool results are pruned only when the history is larger than the worker
+    limit, and the middle elision starts at ``_WORKER_PROMPT_MAX_CHARS``.
+    """
     try:
         from agent.acp_openai_bridge import render_tool_bridge_sections
         tool_sections = render_tool_bridge_sections(tools, tool_choice)
@@ -922,7 +1009,7 @@ def _format_messages_as_prompt(
 
     _HISTORICAL_TOOL_RETENTION_COUNT = 8
     _HISTORICAL_TOOL_MAX_CHARS = 300
-    _TOOL_MAX_CHARS_CAP = 20000
+    _TOOL_MAX_CHARS_CAP = _WORKER_TOOL_RESULT_MAX_CHARS if multipart else _TOOL_RESULT_MAX_CHARS
 
     transcript: list[str] = []
     recovery_turn = last_role == "user" and last_msg is not None and _is_recovery_nudge(last_msg)
@@ -937,6 +1024,12 @@ def _format_messages_as_prompt(
         if len(tool_indices) > _HISTORICAL_TOOL_RETENTION_COUNT
         else set(tool_indices)
     )
+    if multipart and _WORKER_PROMPT_MAX_CHARS > 0:
+        # Delivered in parts, the history has room: older tool results are
+        # reduced to a stub only when keeping them whole would not fit.
+        history_chars = sum(len(str(msg.get("content") or "")) for msg in prior_messages)
+        if history_chars <= _WORKER_PROMPT_MAX_CHARS:
+            recent_tool_cutoff = set(tool_indices)
 
     for i, message in enumerate(prior_messages):
         role = str(message.get("role") or "unknown").strip().lower()
@@ -950,12 +1043,8 @@ def _format_messages_as_prompt(
                     + f"\n[... tool output truncated: {len(rendered_content)} chars ...]\n"
                     + rendered_content[-100:]
                 )
-            elif len(rendered_content) > _TOOL_MAX_CHARS_CAP:
-                rendered_content = (
-                    rendered_content[:12000]
-                    + f"\n[... large tool output truncated: {len(rendered_content)} chars ...]\n"
-                    + rendered_content[-3000:]
-                )
+            else:
+                rendered_content = _cap_tool_output(rendered_content, _TOOL_MAX_CHARS_CAP)
             transcript.append(f"Tool Result ({tool_id}):\n{rendered_content}")
             continue
 
@@ -994,7 +1083,7 @@ def _format_messages_as_prompt(
         user_text = _render_message_content(last_msg.get("content"), media_sink)
         sections.append(
             "### ACTIVE OBJECTIVE:\n"
-            f"The user has submitted a new request:\n\"{user_text}\"\n\n"
+            f"The user has submitted a new request:\n\"{_bounded_restatement(user_text)}\"\n\n"
             "CRITICAL: The conversation transcript below is historical background. "
             "Do NOT silently continue prior tool execution loops or earlier coding tasks unless explicitly requested by the ACTIVE OBJECTIVE. "
             "Focus your attention on answering the new request."
@@ -1024,7 +1113,9 @@ def _format_messages_as_prompt(
     else:
         sections.append("Continue the conversation from the latest message.")
     assembled = [s.strip() for s in _apply_media_viewing_protocol(sections) if s and s.strip()]
-    return "\n\n".join(_fit_prompt_sections(assembled))
+    return "\n\n".join(
+        _fit_prompt_sections(assembled, limit=_WORKER_PROMPT_MAX_CHARS if multipart else None)
+    )
 
 
 def _messages_match_prefix(history: Sequence[dict[str, Any]], incoming: Sequence[dict[str, Any]]) -> bool:
@@ -1048,6 +1139,7 @@ def _format_delta_prompt(
     new_messages: Sequence[dict[str, Any]],
     pending_user_text: str = "",
     media_sink: Optional[set] = None,
+    multipart: bool = False,
 ) -> str:
     """Format only the incremental messages in an ongoing multi-turn interaction.
 
@@ -1074,12 +1166,10 @@ def _format_delta_prompt(
         rendered_content = _render_message_content(msg.get("content"), media_sink)
         if role == "tool":
             tool_id = str(msg.get("tool_call_id") or msg.get("name") or "tool").strip()
-            if len(rendered_content) > 20000:
-                rendered_content = (
-                    rendered_content[:12000]
-                    + f"\n[... large tool output truncated: {len(rendered_content)} chars ...]\n"
-                    + rendered_content[-3000:]
-                )
+            rendered_content = _cap_tool_output(
+                rendered_content,
+                _WORKER_TOOL_RESULT_MAX_CHARS if multipart else _TOOL_RESULT_MAX_CHARS,
+            )
             parts.append(f"Tool Result ({tool_id}):\n{rendered_content}")
             continue
         if role == "assistant":
@@ -1124,7 +1214,126 @@ def _format_delta_prompt(
     else:
         parts.append("Continue the conversation from the latest message above.")
     assembled = [s.strip() for s in _apply_media_viewing_protocol(parts) if s and s.strip()]
-    return "\n\n".join(_fit_prompt_sections(assembled))
+    return "\n\n".join(
+        _fit_prompt_sections(assembled, limit=_WORKER_PROMPT_MAX_CHARS if multipart else None)
+    )
+
+
+# --- Multipart delivery -------------------------------------------------------
+
+# What a part that is not the last one asks the model to reply.
+MULTIPART_ACK = "ACK"
+
+
+def multipart_enabled() -> bool:
+    """Whether a long input is delivered as several messages (read at call time)."""
+    return _PART_MAX_BYTES > _PART_FRAME_BYTES
+
+
+def part_payload_limit() -> int:
+    """UTF-8 bytes of content one part may carry, its frame left out."""
+    return _PART_MAX_BYTES - _PART_FRAME_BYTES
+
+
+def _utf8_len(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _split_oversize(block: str, limit: int) -> list[str]:
+    """Pieces of a block larger than *limit* bytes: whole lines, a longer line by bytes."""
+    pieces: list[str] = []
+    for line in block.splitlines(keepends=True):
+        data = line.encode("utf-8")
+        if len(data) <= limit:
+            pieces.append(line)
+            continue
+        start = 0
+        while start < len(data):
+            end = min(start + limit, len(data))
+            # Never cut inside a multi-byte character.
+            while end < len(data) and (data[end] & 0xC0) == 0x80:
+                end -= 1
+            if end <= start:  # a limit smaller than one character: take that character
+                end = start + 1
+                while end < len(data) and (data[end] & 0xC0) == 0x80:
+                    end += 1
+            pieces.append(data[start:end].decode("utf-8"))
+            start = end
+    return pieces
+
+
+def split_prompt_parts(text: str, max_bytes: int | None = None) -> list[str]:
+    """Split *text* into consecutive parts of at most *max_bytes* UTF-8 bytes.
+
+    Nothing is dropped or rewritten: joining the parts gives *text* back. Cuts
+    fall on blank lines where possible, then on line ends, and inside a line
+    only when that single line is larger than a part. The last part is as full
+    as the limit allows. One part when the text fits, or when *max_bytes* is
+    not positive.
+    """
+    limit = part_payload_limit() if max_bytes is None else max_bytes
+    if limit <= 0 or len(text) * 4 <= limit or _utf8_len(text) <= limit:
+        return [text]
+    pieces: list[tuple[str, int]] = []
+    for block in re.findall(r".+?(?:\n{2,}|\Z)", text, flags=re.S):
+        size = _utf8_len(block)
+        if size <= limit:
+            pieces.append((block, size))
+        else:
+            pieces.extend((piece, _utf8_len(piece)) for piece in _split_oversize(block, limit))
+
+    # The last part is the one the model acts on, so it is filled from the END:
+    # the request and the newest context travel together with the instruction,
+    # instead of a few leftover lines arriving alone.
+    tail_start = len(pieces)
+    tail_bytes = 0
+    while tail_start > 0 and tail_bytes + pieces[tail_start - 1][1] <= limit:
+        tail_start -= 1
+        tail_bytes += pieces[tail_start][1]
+
+    parts: list[str] = []
+    current: list[str] = []
+    current_bytes = 0
+    for piece, size in pieces[:tail_start]:
+        if current and current_bytes + size > limit:
+            parts.append("".join(current))
+            current, current_bytes = [], 0
+        current.append(piece)
+        current_bytes += size
+    if current:
+        parts.append("".join(current))
+    parts.append("".join(piece for piece, _ in pieces[tail_start:]))
+    return parts
+
+
+def frame_prompt_part(content: str, index: int, total: int) -> str:
+    """Wrap part *index* (1-based) of *total* for delivery as its own message.
+
+    A part that is not the last asks for nothing but an acknowledgement, so the
+    model does not start on half an input. The last part tells the model the
+    input is complete and where the rest of it is.
+    """
+    if total <= 1:
+        return content
+    if index < total:
+        head = (
+            f"[MULTIPART INPUT {index}/{total}]\n"
+            f"This is part {index} of {total} of ONE long message, delivered in several parts "
+            "because of a transport size limit. Do not act on it yet: do not answer it, do not "
+            "summarize it and do not call any tool. More parts follow. "
+            f"Reply with exactly: {MULTIPART_ACK}"
+        )
+    else:
+        head = (
+            f"[MULTIPART INPUT {total}/{total}: FINAL PART]\n"
+            f"The long message is now complete. Its parts 1 to {total - 1} are the previous "
+            "messages of this conversation marked MULTIPART INPUT. Read all parts in order as one "
+            "continuous message, then follow the instructions it contains."
+        )
+    return (
+        f"{head}\n--- BEGIN PART {index}/{total} ---\n"
+        f"{content}\n--- END PART {index}/{total} ---"
+    )
 
 
 def media_reference_paths(messages: Any, media_sink: Optional[set] = None) -> set[str]:

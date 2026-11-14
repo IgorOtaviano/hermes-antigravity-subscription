@@ -233,6 +233,7 @@ class AntigravityStream(Iterator[Any]):
         delivery_watch: Any = None,
         delivery_sample_key: str = "",
         expected_conversation_id: str | None = None,
+        ack_turn: bool = False,
     ):
         # Loud pairing, not a defaulted bool (review nit): a future site
         # passing worker_lock WITHOUT worker_lock_held would silently never
@@ -283,6 +284,10 @@ class AntigravityStream(Iterator[Any]):
         # The conversation this turn asked agy to resume, if any: the `init`
         # event must come back with the same id or the context is gone.
         self._expected_conversation_id = expected_conversation_id or ""
+        # A turn that only delivers one part of a long input (multipart): its
+        # reply is an acknowledgement, not an exchange, so it must not become
+        # the conversation history the next turn is matched against.
+        self._ack_turn = ack_turn
         self.conversation_id = ""
         self._closed = False
         self._interrupted = False
@@ -1267,7 +1272,8 @@ class AntigravityStream(Iterator[Any]):
                 watchdog_thread.join(timeout=0.2)
             if self.is_worker:
                 if success and not self._interrupted:
-                    self.client._update_worker_history(self.messages)
+                    if not self._ack_turn:
+                        self.client._update_worker_history(self.messages)
                     self._release_worker_lock_once()
                 else:
                     self.close()
