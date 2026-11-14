@@ -161,12 +161,13 @@ The limit is in bytes of the message, not in tokens. A conversation holds far mo
 
 So the worker path does not shorten a long prompt. `split_prompt_parts` cuts it into parts of at most `HERMES_AGY_PART_MAX_BYTES` (140,000, frame included), on blank lines where possible, then on line ends. Every part but the last is written as its own turn that asks only for `ACK`; the plugin reads that turn to its end and discards the reply. The last part, filled from the end so the request travels with the newest context, is the turn Hermes sees. Usage of all parts is reported with that turn, and the acknowledgements never enter the history Hermes continuations are matched against.
 
-What this changes, live on agy 1.5.9 through the plugin client:
+What this changes, live on agy 1.5.9. The first two rows go through the plugin client, the third through a Hermes agent loop with its file tools:
 
 | Case | Before | After |
 |---|---|---|
 | Full send, 536,202 chars (47 tool schemas, 16 documents) | middle elided to fit 120,000 chars | 4 parts, 32 of 32 markers recalled, 23 s on `gemini-3.8-flash-low`, 138 s on `gemini-4-hydrogen-medium` |
 | Tool result of 334,093 chars in a tool loop | reduced to 15,000 chars | 3 parts, 24 of 24 markers recalled, 16 s and 25 s |
+| Hermes review of 12 files, 10,800 lines, one marker hidden in each (`gemini-3.8-flash-medium`, at most 4 files per turn) | 4 of 12 markers, 14 model calls, 52 file reads, 188 s | 12 of 12 markers, 4 model calls, 12 file reads, 40 s |
 
 Costs and limits:
 
@@ -175,6 +176,7 @@ Costs and limits:
 - A request restated beside the transcript (`ACTIVE OBJECTIVE`, `USER REQUEST THIS TOOL LOOP IS SERVING`) is bounded to its first 3,000 and last 600 characters when it is longer than 4,000. The request itself is always delivered whole, once.
 - A part whose turn does not complete fails the whole turn; the worker is terminated and the next attempt is a full send.
 - The oneshot path is not multipart. It has no conversation to deliver parts into.
+- Hermes itself bounds the tool results of one turn at 200,000 characters (`tools/budget_config.py`, not configurable): past that it saves the largest results to disk and sends a preview with the path. A model that reads 12 files of 32,000 characters in one turn receives 5 of them whole. This is the same for every provider; the reviewer has to read fewer files per turn or page the saved results.
 - `HERMES_AGY_PART_MAX_BYTES=0` turns multipart off and restores the single-message budgets.
 
 ## Multimodal media
