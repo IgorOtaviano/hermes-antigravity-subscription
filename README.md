@@ -25,7 +25,8 @@ This plugin lets Hermes use Gemini and Claude models through your existing Antig
 - **Subagent concurrency**: Each completion turn runs in its own process group (`start_new_session=True`). Multiple Hermes subagents can request completions concurrently without shared state.
 - **Windows console suppression**: On Windows, every console-subsystem child (`agy`, `cmdkey`, `taskkill`, and `agy models`) is spawned with `CREATE_NO_WINDOW`, so a GUI-hosted Hermes without a console of its own gets no visible console window per call. `AGY_CLI_DISABLE_AUTO_UPDATE=true` is set in the child environment so `agy`'s background updater cannot open one either.
 - **Filesystem isolation**: Subprocesses run in an isolated, private temporary working directory per client and slash commands are disabled. Local `GEMINI.md` and `AGENTS.md` project files are not read.
-- **Tool output pruning**: Old tool results (diffs, directory trees, test output) dominate wire payload in long sessions. The prompt builder keeps the last 8 tool results intact and caps older tool outputs at 300 characters. A 20k character safety limit with head/tail preservation guards individual tool calls. In a 336-message session, this cut wire payload from 600 KB to 180 KB (70% reduction).
+- **Long inputs in several messages**: `agy` cuts a single message between 183,000 and 194,000 UTF-8 bytes and drops the rest without an error, while a conversation keeps everything it was told. On the persistent worker a prompt over 140,000 bytes is delivered as consecutive messages of the same conversation, so tool results, history and tool schemas arrive whole. See [Long inputs](#long-inputs-multipart-delivery).
+- **Tool output pruning**: applies to a single-message send only (multipart off, or the oneshot path). The prompt builder keeps the last 8 tool results intact and caps older tool outputs at 300 characters, and a 20k character limit with head/tail preservation guards individual tool calls. With multipart on, one tool result is kept up to 400,000 characters and older results are reduced only when the history exceeds 800,000 characters.
 - **Error classification and recovery**: `classify_api_error` detects `agy` PubSub stalls (`subscriber fell behind updates, stalled for 5s`), trajectory limits, and empty SUCCESS status (returning `context_overflow` with `should_compress: True`). It classifies credit balance exhaustion and billing caps as `billing` for immediate failover, and maps account verification and Terms of Service notices to `auth_permanent` to surface resolution links without retry loops.
 
 ---
@@ -68,9 +69,11 @@ previous valid sample. Set `ANTIGRAVITY_DISABLE_DELIVERY_WATCH=1` to disable it.
 
 Blind spots: the first request, stable-size truncation, and normal incremental tool
 loops. Changes in text density can still cause false positives. This warning does
-not prevent or repair the upstream tail truncation tracked in
+not prevent or repair the tail truncation tracked in
 [issue 29](https://github.com/soyelmismo/hermes-antigravity-subscription/issues/29).
-Split large single-shot inputs or use a provider that delivers them intact.
+Multipart delivery does, on the persistent worker. The oneshot path (a request
+that arrives while the worker is busy) still sends one message: there the
+120,000 character budget elides the middle so the head and the request survive.
 Reasoning text in `stream-json` remains blocked upstream: `agy` exposes no flag for it
 ([issue 31](https://github.com/soyelmismo/hermes-antigravity-subscription/issues/31)).
 
@@ -142,6 +145,39 @@ The CLI reads its home once, at spawn, so everything below is written right befo
 - **`--sandbox` on every spawn.** agy's terminal restrictions, the flag agentes.chat passes on every turn. It bounds the one case the stream watcher cannot prevent: a model that ignores the protocol and asks for a native terminal step in the window before the process is killed. File reads (the media attach) are permission-gated, not terminal, so they are unaffected; an explicit `ANTIGRAVITY_ARGS` still wins verbatim.
 - **`AGY_ERROR` is parsed.** The CLI's own failure line (`AGY_ERROR: {"short_error": …}` on 1.5.8, the richer status object on older builds) becomes the turn's message, with the plan's reset words when it names them, and quota exhaustion is classified as a rate limit so Hermes backs off and fails over instead of retrying a quota that returns in hours. A limit reported only by status (`RESOURCE_EXHAUSTED` / 429) keeps that status in the message, so the verdict does not depend on the wording. `result.finished_reason: "print_timeout"` reads as a timeout instead of an empty result.
 - **A lost conversation fails loudly.** `agy` only warns when it doesn't know the `--conversation` it was told to resume, then starts a new one — which would silently drop the context a continuation turn's delta-only prompt relies on. The turn fails with `AntigravityConversationLost` instead. A non-streaming caller retries once as a fresh conversation with the full history, after taking the worker lock back. A streaming caller receives the error, and the next attempt is a full send. A continuation that already fell back to a fresh conversation (broken worker pipe) expects no id.
+
+## Long inputs: multipart delivery
+
+`agy` cuts one user message at a fixed size and reports nothing: the turn completes with exit code 0. Measured on agy 1.5.9, same result on `gemini-3.8-flash-low` and `gemini-4-hydrogen-medium`:
+
+| Single message | Arrived |
+|---|---|
+| 334,558 chars of English prose | cut at about 186,000 bytes |
+| 337,956 chars of Python source | cut between 183,100 and 196,800 bytes |
+| 337,956 chars of accented Portuguese (389,148 bytes) | cut between 178,100 and 194,300 bytes |
+| 167,916 chars of digit tables (177,208 input tokens) | whole |
+
+The limit is in bytes of the message, not in tokens. A conversation holds far more than one message does: four messages of 139,000 characters each in one conversation (151,755 input tokens) were recalled completely.
+
+So the worker path does not shorten a long prompt. `split_prompt_parts` cuts it into parts of at most `HERMES_AGY_PART_MAX_BYTES` (140,000, frame included), on blank lines where possible, then on line ends. Every part but the last is written as its own turn that asks only for `ACK`; the plugin reads that turn to its end and discards the reply. The last part, filled from the end so the request travels with the newest context, is the turn Hermes sees. Usage of all parts is reported with that turn, and the acknowledgements never enter the history Hermes continuations are matched against.
+
+What this changes, live on agy 1.5.9. The first two rows go through the plugin client, the third through a Hermes agent loop with its file tools:
+
+| Case | Before | After |
+|---|---|---|
+| Full send, 536,202 chars (47 tool schemas, 16 documents) | middle elided to fit 120,000 chars | 4 parts, 32 of 32 markers recalled, 23 s on `gemini-3.8-flash-low`, 138 s on `gemini-4-hydrogen-medium` |
+| Tool result of 334,093 chars in a tool loop | reduced to 15,000 chars | 3 parts, 24 of 24 markers recalled, 16 s and 25 s |
+| Hermes review of 12 files, 10,800 lines, one marker hidden in each (`gemini-3.8-flash-medium`, at most 4 files per turn) | 4 of 12 markers, 14 model calls, 52 file reads, 188 s | 12 of 12 markers, 4 model calls, 12 file reads, 40 s |
+
+Costs and limits:
+
+- Each extra part is one more model turn: 4 to 7 seconds on Flash, more on a thinking model, plus the input tokens of the conversation so far (served from cache after the first part).
+- The whole input is still bounded: past `HERMES_AGY_WORKER_PROMPT_MAX_CHARS` (800,000) older tool results are reduced to stubs and then the middle of the transcript is elided. The declared context window (239,000 tokens) is unchanged.
+- A request restated beside the transcript (`ACTIVE OBJECTIVE`, `USER REQUEST THIS TOOL LOOP IS SERVING`) is bounded to its first 3,000 and last 600 characters when it is longer than 4,000. The request itself is always delivered whole, once.
+- A part whose turn does not complete fails the whole turn; the worker is terminated and the next attempt is a full send.
+- The oneshot path is not multipart. It has no conversation to deliver parts into.
+- Hermes itself bounds the tool results of one turn at 200,000 characters (`tools/budget_config.py`, not configurable): past that it saves the largest results to disk and sends a preview with the path. A model that reads 12 files of 32,000 characters in one turn receives 5 of them whole. This is the same for every provider; the reviewer has to read fewer files per turn or page the saved results.
+- `HERMES_AGY_PART_MAX_BYTES=0` turns multipart off and restores the single-message budgets.
 
 ## Multimodal media
 
@@ -230,6 +266,10 @@ Multiple agy sessions on one account contend for the shared OAuth token: whoever
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `HERMES_ANTIGRAVITY_CONTEXT_LENGTH` | `239000` | Override the declared context window (tokens). Also checks `ANTIGRAVITY_CONTEXT_LENGTH`. Hermes triggers auto-compression based on this value (e.g. at 75% threshold, ~179k tokens). |
+| `HERMES_AGY_PART_MAX_BYTES` | `140000` | Largest single message to `agy`, in UTF-8 bytes. A longer prompt is delivered in several messages on the worker path. `0` turns multipart delivery off. Keep it under the 183,000 bytes where `agy` starts cutting. |
+| `HERMES_AGY_WORKER_PROMPT_MAX_CHARS` | `800000` | With multipart on: size of the whole input past which older tool results are reduced and the middle of the transcript is elided. |
+| `HERMES_AGY_TOOL_RESULT_MAX_CHARS` | `400000` | With multipart on: size of one tool result past which its middle is cut. |
+| `HERMES_AGY_PROMPT_MAX_CHARS` | `120000` | Single-message budget (multipart off, and the oneshot path): past it the middle of the transcript is elided. `0` disables it. |
 | `ANTIGRAVITY_COMMAND` | `agy` | Path to the `agy` binary. Also checks `AGY_CLI_PATH` and `ANTIGRAVITY_CLI_PATH`. |
 | `ANTIGRAVITY_ARGS` | (none) | Extra arguments to pass to the `agy` subprocess. |
 | `ANTIGRAVITY_CONFIG_DIR` | (none) | Override the config directory, bypassing keyring and token-file detection. |
