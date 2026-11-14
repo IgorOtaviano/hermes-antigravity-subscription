@@ -120,6 +120,10 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT_SECONDS = 300.0
+# How long the lost-conversation retry waits to take the worker request lock
+# back. The failed stream releases it from close(), which can run on a helper
+# thread after terminating the worker (up to ~2 s).
+_CONVERSATION_RETRY_LOCK_TIMEOUT = 5.0
 
 # agy prints these when its token source cannot be built — the signature of
 # OAuth contention with ANOTHER agy session on the same Google account (each
@@ -1029,6 +1033,10 @@ class AntigravityClient:
 
         worker_acquired = self._worker_lock.acquire(blocking=False)
         if worker_acquired:
+            # Set when this turn no longer owns the worker or its lock (another
+            # turn took them while a retry was waiting): the failure handler
+            # below must then leave both alone.
+            worker_lock_lost = False
             try:
                 with self._lock:
                     ref_history = (
@@ -1040,6 +1048,10 @@ class AntigravityClient:
                     conv_id_to_resume = self._worker_conversation_id if is_continuation else None
 
                 comparable_full_send = not is_continuation
+                # Only a turn that actually resumes has a conversation to
+                # lose. Cleared below when the resume falls back to a fresh
+                # full send, which legitimately comes back under a new id.
+                expected_conversation_id = conv_id_to_resume if is_continuation else None
                 if is_continuation:
                     proc = self._get_or_spawn_worker(
                         resolved_model, effort, conversation_id=conv_id_to_resume
@@ -1082,6 +1094,7 @@ class AntigravityClient:
                     proc.stdin.flush()
                 except (BrokenPipeError, OSError):
                     comparable_full_send = True
+                    expected_conversation_id = None
                     with self._lock:
                         self._terminate_worker_locked(keep_conversation=False)
                         self._purge_isolated_conversations()
@@ -1122,7 +1135,7 @@ class AntigravityClient:
                     # A continuation's prompt is a delta: if agy answers with a
                     # different conversation, the context is gone and the turn
                     # must fail instead of answering from nothing.
-                    expected_conversation_id=conv_id_to_resume if is_continuation else None,
+                    expected_conversation_id=expected_conversation_id,
                 )
                 if stream:
                     return stream_iter
@@ -1137,11 +1150,25 @@ class AntigravityClient:
                         # delta-only prompt has no context to attach to. Retry
                         # ONCE as a fresh conversation with the whole history, so
                         # the user never sees a contextless answer or a bare
-                        # error. The failed stream already closed the worker, so
-                        # the conversation id is cleared for the respawn.
+                        # error. The failed stream already closed the worker and
+                        # cleared the conversation id.
                         if conversation_retried:
                             raise
                         conversation_retried = True
+                        # The failed stream gave the worker request lock back
+                        # on its way out (close() terminates the worker, then
+                        # releases). Take it again before touching the worker:
+                        # without it another turn can start on the worker this
+                        # retry is about to kill and respawn, and the retry
+                        # stream below would later "release" a lock it never
+                        # held. If another turn got there first, give up: the
+                        # conversation id is already cleared, so the caller's
+                        # own retry is a full send.
+                        if not self._worker_lock.acquire(
+                            timeout=_CONVERSATION_RETRY_LOCK_TIMEOUT
+                        ):
+                            worker_lock_lost = True
+                            raise
                         logger.warning(
                             "Antigravity lost the conversation a turn resumed; "
                             "retrying once with the full context."
@@ -1240,9 +1267,10 @@ class AntigravityClient:
                     if self._worker_lock.locked():
                         self._worker_lock.release()
             except Exception:
-                self._terminate_worker()
-                if self._worker_lock.locked():
-                    self._worker_lock.release()
+                if not worker_lock_lost:
+                    self._terminate_worker()
+                    if self._worker_lock.locked():
+                        self._worker_lock.release()
                 raise
         else:
             return self._run_oneshot_completion(
