@@ -545,6 +545,22 @@ _PROMPT_PREAMBLE = (
     "- When the user's latest message introduces a new question or task, do NOT continue prior completed tasks or tool loops. Address the user's latest request directly.",
 )
 
+# Prompt budget (issue #29). A single turn whose assembled prompt is very large
+# gets truncated by agy from the TAIL, which silently drops the latest user
+# request and the tool-loop instructions at the end of the prompt. The fix is
+# the same one agentes-chat uses for its cursor prompt: a hard character budget
+# with MIDDLE elision, so the head (system preamble + tool schemas) and the tail
+# (latest user request, tool-loop objective) always survive.
+#
+# Override with HERMES_AGY_PROMPT_MAX_CHARS; 0 or negative disables the budget.
+_PROMPT_MAX_CHARS = int(os.environ.get("HERMES_AGY_PROMPT_MAX_CHARS", "120000") or 120000)
+
+# Sections that must never be elided, even when over budget: instruction blocks
+# and the newest request the model has to answer (the last section is always
+# kept as well, whatever it is).
+_PROMPT_PINNED_PREFIXES = ("### ",)
+_TRANSCRIPT_SECTION_PREFIX = "Conversation transcript:"
+
 # agy attaches media pixels through its own native read step: the model must
 # call read_file/view_file on the referenced path, and the CLI then inlines the
 # file as a media block. The blanket "native tools are disabled" preamble would
@@ -753,6 +769,117 @@ def _tool_loop_objective_section(user_text: str) -> str:
     )
 
 
+def _elide_blocks(
+    blocks: list[str], room: int, head_ratio: float = 0.55
+) -> tuple[list[str], int, int, int]:
+    """Keep the head and the tail of a block list, dropping the middle.
+
+    Returns ``(kept_blocks, head_count, dropped_count, dropped_chars)``.
+    ``head_count`` is how many of the returned blocks came from the head, so the
+    caller can put the elision marker exactly at the cut. ``room`` is the
+    character budget for the kept blocks, separators included.
+    """
+    if room <= 0 or not blocks:
+        return [], 0, len(blocks), sum(len(b) for b in blocks)
+    if len(blocks) <= 2:
+        return list(blocks), len(blocks), 0, 0
+
+    head_budget = int(room * head_ratio)
+    tail_budget = room - head_budget
+    head: list[str] = []
+    tail: list[str] = []
+    head_chars = 0
+    tail_chars = 0
+
+    for block in blocks:
+        cost = len(block) + 2
+        if head_chars + cost > head_budget:
+            break
+        head.append(block)
+        head_chars += cost
+
+    for block in reversed(blocks[len(head):]):
+        cost = len(block) + 2
+        if tail_chars + cost > tail_budget:
+            break
+        tail.insert(0, block)
+        tail_chars += cost
+
+    dropped = blocks[len(head):len(blocks) - len(tail)]
+    return [*head, *tail], len(head), len(dropped), sum(len(b) for b in dropped)
+
+
+def _fit_prompt_sections(sections: list[str], limit: int | None = None) -> list[str]:
+    """Keep the assembled prompt under a character budget by eliding the middle.
+
+    Mirrors the cursor prompt budget in agentes-chat: the head (system preamble,
+    tool schemas) and the tail (latest user request, tool-loop instructions)
+    survive; the middle of the transcript is dropped with a marker. agy truncates
+    from the tail when a prompt is too large, which silently deletes the request
+    the model has to answer (issue #29). Pinned sections (``### ...``) and the
+    last section are never elided.
+    """
+    budget = _PROMPT_MAX_CHARS if limit is None else limit
+    if budget <= 0:
+        return sections
+
+    def _size(items: list[str]) -> int:
+        return sum(len(s) for s in items) + 2 * max(len(items) - 1, 0)
+
+    total = _size(sections)
+    if total <= budget:
+        return sections
+
+    result = list(sections)
+
+    # 1) Elide the middle of the transcript first: it is the largest block and
+    #    the least critical one to keep whole.
+    idx = next(
+        (i for i, s in enumerate(result) if s.startswith(_TRANSCRIPT_SECTION_PREFIX)),
+        None,
+    )
+    if idx is not None:
+        prefix = _TRANSCRIPT_SECTION_PREFIX
+        body = result[idx][len(prefix):]
+        blocks = [b for b in body.split("\n\n") if b.strip()]
+        overhead = total - len(result[idx])
+        room = budget - overhead
+        kept, head_count, dropped, dropped_chars = _elide_blocks(blocks, room)
+        if dropped:
+            marker = (
+                f"[... {dropped} transcript blocks elided "
+                f"({dropped_chars} chars) to fit the prompt budget ...]"
+            )
+            kept.insert(head_count, marker)
+            result[idx] = prefix + "\n\n" + "\n\n".join(kept)
+            total = _size(result)
+
+    # 2) Still over budget: trim the middle of oversized non-pinned sections
+    #    (tool schemas), never the last one.
+    if total > budget:
+        for i in range(len(result) - 1):
+            if total <= budget:
+                break
+            section = result[i]
+            if section.startswith(_PROMPT_PINNED_PREFIXES):
+                continue
+            excess = total - budget
+            keep = len(section) - excess - 400
+            if keep < 2000:
+                continue
+            head_len = int(keep * 0.6)
+            tail_len = keep - head_len
+            trimmed = (
+                section[:head_len]
+                + f"\n\n[... {len(section) - keep} chars elided from the middle of this section to fit the prompt budget ...]\n\n"
+                + section[-tail_len:]
+            )
+            total -= len(section) - len(trimmed)
+            result[i] = trimmed
+
+    return result
+
+
 def _format_messages_as_prompt(
     messages: list[dict[str, Any]],
     model: str | None = None,
@@ -896,7 +1023,8 @@ def _format_messages_as_prompt(
             sections.append(_latest_user_request_section(user_text))
     else:
         sections.append("Continue the conversation from the latest message.")
-    return "\n\n".join(s.strip() for s in _apply_media_viewing_protocol(sections) if s and s.strip())
+    assembled = [s.strip() for s in _apply_media_viewing_protocol(sections) if s and s.strip()]
+    return "\n\n".join(_fit_prompt_sections(assembled))
 
 
 def _messages_match_prefix(history: Sequence[dict[str, Any]], incoming: Sequence[dict[str, Any]]) -> bool:
@@ -995,7 +1123,8 @@ def _format_delta_prompt(
             parts.append(_latest_user_request_section(user_text))
     else:
         parts.append("Continue the conversation from the latest message above.")
-    return "\n\n".join(s.strip() for s in _apply_media_viewing_protocol(parts) if s and s.strip())
+    assembled = [s.strip() for s in _apply_media_viewing_protocol(parts) if s and s.strip()]
+    return "\n\n".join(_fit_prompt_sections(assembled))
 
 
 def media_reference_paths(messages: Any, media_sink: Optional[set] = None) -> set[str]:
