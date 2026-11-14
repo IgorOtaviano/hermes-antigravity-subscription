@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from typing import Any, Iterator, NamedTuple
 
 try:
-    from .process import _check_early_quota_error
+    from .process import _check_early_quota_error, parse_agy_error
     from .prompt import (
         _TOOL_CALL_CLOSE,
         _find_tool_call_close,
@@ -27,7 +27,7 @@ try:
         media_reference_paths,
     )
 except ImportError:
-    from process import _check_early_quota_error
+    from process import _check_early_quota_error, parse_agy_error
     from prompt import (
         _TOOL_CALL_CLOSE,
         _find_tool_call_close,
@@ -37,6 +37,18 @@ except ImportError:
         _parse_tool_block,
         media_reference_paths,
     )
+
+
+class AntigravityConversationLost(RuntimeError):
+    """The CLI answered a ``--conversation`` resume with a different conversation.
+
+    agy only warns when it doesn't know the id it was told to resume, then
+    starts a new one — which would silently drop the context this turn's
+    delta-only prompt depends on (agentes.chat's brain-antigravity.ts kills and
+    restarts the turn on the same condition). Raising here fails the turn
+    loudly instead of answering from a contextless conversation; the failure
+    clears the worker's conversation id, so the retry is a full send.
+    """
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +232,7 @@ class AntigravityStream(Iterator[Any]):
         prompt_chars: int = 0,
         delivery_watch: Any = None,
         delivery_sample_key: str = "",
+        expected_conversation_id: str | None = None,
     ):
         # Loud pairing, not a defaulted bool (review nit): a future site
         # passing worker_lock WITHOUT worker_lock_held would silently never
@@ -267,6 +280,9 @@ class AntigravityStream(Iterator[Any]):
         # Worker deltas and concurrent oneshots must never share samples.
         self.delivery_watch = delivery_watch
         self.delivery_sample_key = delivery_sample_key
+        # The conversation this turn asked agy to resume, if any: the `init`
+        # event must come back with the same id or the context is gone.
+        self._expected_conversation_id = expected_conversation_id or ""
         self.conversation_id = ""
         self._closed = False
         self._interrupted = False
@@ -595,6 +611,7 @@ class AntigravityStream(Iterator[Any]):
         process_exit: int | None,
         has_evidence: bool,
         stop_detail: str = "",
+        finished_reason: str = "",
     ) -> str:
         """Detail for a turn that ended without proving success.
 
@@ -611,6 +628,8 @@ class AntigravityStream(Iterator[Any]):
         delivered); without output the result genuinely carried nothing
         ("empty result", the wording the pre-existing tests pin).
         """
+        if finished_reason == "print_timeout":
+            return "The Antigravity CLI ran out of time (print-timeout)"
         if saw_result:
             if has_evidence:
                 detail = (
@@ -643,6 +662,25 @@ class AntigravityStream(Iterator[Any]):
             except Exception:
                 return ""
         return ""
+
+    def _failure_detail(
+        self, stderr_out: str, error_msg: str, fallback: str
+    ) -> str:
+        """The CLI's own words for a turn that produced nothing.
+
+        ``AGY_ERROR: {…}`` (agy 1.2.x) carries the real reason — canonical
+        status, HTTP/gRPC code, retryability — and the plan's reset words when
+        the failure is a quota. Without this the raw JSON blob reached the user
+        as one opaque sentence and a quota-exhausted turn looked like any other
+        error. agentes.chat reads the same line (brain-antigravity.ts).
+        """
+        parsed = parse_agy_error(stderr_out)
+        if parsed:
+            detail = parsed["message"]
+            if parsed.get("resets"):
+                detail = f"{detail} (resets {parsed['resets']})"
+            return detail
+        return error_msg or stderr_out.strip() or fallback
 
     def _stream_generator(self) -> Iterator[Any]:
         deadline = time.monotonic() + self.timeout
@@ -680,6 +718,9 @@ class AntigravityStream(Iterator[Any]):
         in_tool_call = False
         error_msg = ""
         status = ""
+        # `result.finished_reason`: agy names a print-timeout there, which is a
+        # different failure from a model error and reads as one.
+        finished_reason = ""
         # Positive evidence about how the stream ended: did a `result`
         # event conclude the turn, and did the run abort early because
         # agy attempted a native tool invocation (security neutralization)?
@@ -767,6 +808,20 @@ class AntigravityStream(Iterator[Any]):
                     init_data = event.get("init", {})
                     if not self.conversation_id:
                         self.conversation_id = init_data.get("conversation_id", "")
+                    if (
+                        self._expected_conversation_id
+                        and self.conversation_id
+                        and self.conversation_id != self._expected_conversation_id
+                    ):
+                        # agy warns on an unknown --conversation and starts a
+                        # new one; answering this turn would drop the context
+                        # its delta-only prompt relies on.
+                        raise AntigravityConversationLost(
+                            "Antigravity lost the conversation this turn was to "
+                            f"resume ({self._expected_conversation_id[:12]} came back "
+                            f"as {self.conversation_id[:12]}), so its context would be "
+                            "dropped. The next attempt sends the full conversation."
+                        )
                     if self.conversation_id and self.is_worker and self.client and hasattr(self.client, "_set_worker_conversation_id"):
                         self.client._set_worker_conversation_id(self.conversation_id)
 
@@ -871,6 +926,7 @@ class AntigravityStream(Iterator[Any]):
                     if self.conversation_id and self.is_worker and self.client and hasattr(self.client, "_set_worker_conversation_id"):
                         self.client._set_worker_conversation_id(self.conversation_id)
                     status = res.get("status", "")
+                    finished_reason = str(res.get("finished_reason") or "")
                     if "usage" in res:
                         usage_data = res["usage"]
                     if "error" in res:
@@ -1025,7 +1081,11 @@ class AntigravityStream(Iterator[Any]):
                     quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_wall)
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
-                    err_detail = error_msg or stderr_out.strip() or f"Process exited with return code {returncode}"
+                    err_detail = self._failure_detail(
+                        stderr_out,
+                        error_msg,
+                        f"Process exited with return code {returncode}",
+                    )
                     raise RuntimeError(f"Antigravity execution failed: {err_detail}")
 
                 # Precedence: this positive-evidence raise comes AFTER the
@@ -1055,6 +1115,7 @@ class AntigravityStream(Iterator[Any]):
                             process_exit=returncode,
                             has_evidence=has_content or has_tool_calls,
                             stop_detail=stop_detail,
+                            finished_reason=finished_reason,
                         )
                     )
             else:
@@ -1084,7 +1145,11 @@ class AntigravityStream(Iterator[Any]):
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
                     stderr_out = self._get_stderr_tail()
-                    err_detail = error_msg or stderr_out.strip() or f"worker process exited with return code {worker_exit}"
+                    err_detail = self._failure_detail(
+                        stderr_out,
+                        error_msg,
+                        f"worker process exited with return code {worker_exit}",
+                    )
                     raise RuntimeError(f"Antigravity execution failed: {err_detail}")
 
                 # Positive-evidence verdict, placed AFTER the quota and
@@ -1129,6 +1194,7 @@ class AntigravityStream(Iterator[Any]):
                             process_exit=worker_exit,
                             has_evidence=has_content or has_tool_calls,
                             stop_detail=stop_detail,
+                            finished_reason=finished_reason,
                         )
                     )
 

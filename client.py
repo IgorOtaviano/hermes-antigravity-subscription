@@ -41,6 +41,7 @@ try:
         _own_process_group,
         build_child_env,
         is_authenticated,
+        prepare_agy_home,
         read_media_rules,
         reap_orphaned_plugin_workers,
         resolve_agy_command,
@@ -65,7 +66,11 @@ try:
         media_reference_paths,
     )
     from .delivery import DeliveryWatch
-    from .stream import AntigravityStream, collect_stream_completion
+    from .stream import (
+        AntigravityConversationLost,
+        AntigravityStream,
+        collect_stream_completion,
+    )
     from .debug import dump_prompt_debug
 except ImportError:
     from models import (
@@ -80,6 +85,7 @@ except ImportError:
         _own_process_group,
         build_child_env,
         is_authenticated,
+        prepare_agy_home,
         read_media_rules,
         reap_orphaned_plugin_workers,
         resolve_agy_command,
@@ -104,7 +110,11 @@ except ImportError:
         media_reference_paths,
     )
     from delivery import DeliveryWatch
-    from stream import AntigravityStream, collect_stream_completion
+    from stream import (
+        AntigravityConversationLost,
+        AntigravityStream,
+        collect_stream_completion,
+    )
     from debug import dump_prompt_debug
 
 logger = logging.getLogger(__name__)
@@ -392,7 +402,22 @@ class AntigravityClient:
         self.api_key = api_key or "antigravity-directsdk"
         self.base_url = base_url or AGY_MARKER_BASE_URL
         self._command = command or resolve_agy_command()
-        self._args = list(args or ["--output-format", "stream-json", "--disable-slash-commands"])
+        # `--sandbox` (agy: "run in a sandbox with terminal restrictions
+        # enabled") is the same flag agentes.chat passes on every turn. It
+        # bounds the one case this plugin cannot prevent: a model that ignores
+        # the <tool_call> protocol and asks agy for a native terminal step, in
+        # the window before the stream watcher kills the process. File reads
+        # (the media attach) are permission-gated, not terminal, so they are
+        # unaffected. An explicit ANTIGRAVITY_ARGS still wins, verbatim.
+        self._args = list(
+            args
+            or [
+                "--output-format",
+                "stream-json",
+                "--disable-slash-commands",
+                "--sandbox",
+            ]
+        )
         self._temp_dir = None
         if cwd:
             self._cwd = cwd
@@ -824,6 +849,10 @@ class AntigravityClient:
             # file right before every spawn so a worker never starts from a
             # stale copy ("You are not logged into Antigravity").
             sync_isolated_token(self._isolated_home)
+            # agy reads its home at spawn only: drop anything an earlier turn
+            # could have planted and write the hardening settings now, so this
+            # process is the one that sees them.
+            prepare_agy_home(self._isolated_home, self._isolated_gemini_dir)
 
             cmd_args = [self._command, "--input-format", "stream-json", *self._args]
             if conversation_id:
@@ -905,6 +934,7 @@ class AntigravityClient:
 
         # Same account-contention guard as the worker spawn path.
         sync_isolated_token(self._isolated_home)
+        prepare_agy_home(self._isolated_home, self._isolated_gemini_dir)
 
         proc = subprocess.Popen(
             cmd_args,
@@ -1089,13 +1119,77 @@ class AntigravityClient:
                     prompt_chars=len(prompt_payload),
                     delivery_watch=self._delivery_watch if comparable_full_send else None,
                     delivery_sample_key=f"{resolved_model}:{effort}",
+                    # A continuation's prompt is a delta: if agy answers with a
+                    # different conversation, the context is gone and the turn
+                    # must fail instead of answering from nothing.
+                    expected_conversation_id=conv_id_to_resume if is_continuation else None,
                 )
                 if stream:
                     return stream_iter
                 completion: Any = None
                 auth_retried = False
+                conversation_retried = False
                 while True:
-                    completion = collect_stream_completion(stream_iter)
+                    try:
+                        completion = collect_stream_completion(stream_iter)
+                    except AntigravityConversationLost:
+                        # agy didn't have the conversation this turn resumed: its
+                        # delta-only prompt has no context to attach to. Retry
+                        # ONCE as a fresh conversation with the whole history, so
+                        # the user never sees a contextless answer or a bare
+                        # error. The failed stream already closed the worker, so
+                        # the conversation id is cleared for the respawn.
+                        if conversation_retried:
+                            raise
+                        conversation_retried = True
+                        logger.warning(
+                            "Antigravity lost the conversation a turn resumed; "
+                            "retrying once with the full context."
+                        )
+                        with self._lock:
+                            self._terminate_worker_locked(keep_conversation=False)
+                            self._purge_isolated_conversations()
+                        proc = self._get_or_spawn_worker(
+                            resolved_model, effort, conversation_id=None
+                        )
+                        prompt_payload = _format_messages_as_prompt(
+                            messages_list,
+                            model=resolved_model,
+                            tools=tools,
+                            tool_choice=tool_choice,
+                            media_sink=self._materialized_media,
+                        )
+                        dump_prompt_debug(
+                            prompt=prompt_payload,
+                            branch="conversation-lost",
+                            model=resolved_model,
+                            messages=messages_list,
+                        )
+                        event_msg = {
+                            "event": "user",
+                            "message": {"content": prompt_payload},
+                        }
+                        if proc.stdin:
+                            proc.stdin.write(json.dumps(event_msg) + "\n")
+                            proc.stdin.flush()
+                        with self._lock:
+                            worker_usage_baseline = self._worker_usage_baseline
+                        stream_iter = AntigravityStream(
+                            proc=proc,
+                            client=self,
+                            model=resolved_model,
+                            timeout=effective_timeout,
+                            tools=tools,
+                            is_worker=True,
+                            worker_lock=self._worker_lock,
+                            worker_lock_held=True,
+                            messages=messages_list,
+                            usage_baseline=worker_usage_baseline,
+                            prompt_chars=len(prompt_payload),
+                            delivery_watch=self._delivery_watch,
+                            delivery_sample_key=f"{resolved_model}:{effort}",
+                        )
+                        continue
                     if auth_retried or not _empty_no_result(completion):
                         break
                     if not _stderr_shows_auth_contention(proc):

@@ -133,6 +133,16 @@ Strict baseline: `PATH`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `TERM`, `TMPDIR`/`TEM
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## Turn-home hardening
+
+The CLI reads its home once, at spawn, so everything below is written right before every worker and every oneshot process (`process.prepare_agy_home`). The behaviors are ported from [agentes.chat](https://github.com/agentes-chat/agentes-chat)'s `agy-home.ts` and `brain-antigravity.ts` (ADR 0143), where the same CLI is driven in production.
+
+- **Planted config is dropped.** A turn can leave global agents, skills, rules, hooks, plugins, project settings and the `GEMINI.md` / `AGENTS.md` rule files in the CLI's home, which a later turn would then load as its own config — outside every tool and outside the `<tool_call>` protocol this plugin depends on. `AGY_PLANTED` lists the same set agentes.chat removes; the paths are relative to the per-client isolated home, so a user's real `~/.gemini` is never in reach.
+- **`settings.json` carries the hardening.** `useG1Credits: false` (a turn past the plan's quota fails instead of silently spending the account's AI credits; set `ANTIGRAVITY_USE_CREDITS=1` to opt a paid account back in), `enableTerminalSandbox: true`, and the three headless-noise switches off (`notifications`, `showTips`, `showFeedbackSurvey`). Everything the plugin does not own is preserved: the sign-in's `auth`, an Enterprise seat's `gcp`, and the per-file media `permissions.allow` rules. `toolPermission` and `allowNonWorkspaceAccess` are deliberately left alone — this plugin wants agy's native tools refused and needs out-of-workspace paths readable for the media attach.
+- **`--sandbox` on every spawn.** agy's terminal restrictions, the flag agentes.chat passes on every turn. It bounds the one case the stream watcher cannot prevent: a model that ignores the protocol and asks for a native terminal step in the window before the process is killed. File reads (the media attach) are permission-gated, not terminal, so they are unaffected; an explicit `ANTIGRAVITY_ARGS` still wins verbatim.
+- **`AGY_ERROR` is parsed.** The CLI's own failure line (`AGY_ERROR: {"short_error": …}` on 1.5.8, the richer status object on older builds) becomes the turn's message, with the plan's reset words when it names them, and quota exhaustion is classified as a rate limit so Hermes backs off and fails over instead of retrying a quota that returns in hours. `result.finished_reason: "print_timeout"` reads as a timeout instead of an empty result.
+- **A lost conversation fails loudly.** `agy` only warns when it doesn't know the `--conversation` it was told to resume, then starts a new one — which would silently drop the context a continuation turn's delta-only prompt relies on. The turn fails with `AntigravityConversationLost` instead, and a non-streaming caller retries once as a fresh conversation with the full history.
+
 ## Multimodal media
 
 Image, video and audio attachments are embedded natively: the plugin materializes each attachment (local path, `file://` URI or remote URL) to a cache file and references it in the prompt as `[Image](/abs/path)`, which `agy` reads through its native `read_file` tool and uploads to Google as real pixels. No transcription, no auxiliary descriptions.
